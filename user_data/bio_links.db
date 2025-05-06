@@ -1,18 +1,1 @@
-def add_user_to_db(user_id: int, username: str, bio_text: str, has_link: bool):
-    """Add or update user bio information in database"""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        
-        # Insert or replace user data
-        c.execute('''INSERT OR REPLACE INTO users 
-                    (user_id, username, bio_text, has_link, last_checked)
-                    VALUES (?, ?, ?, ?, ?)''',
-                 (user_id, username, bio_text, int(has_link), datetime.now().isoformat()))
-        
-        conn.commit()
-        logger.info(f"Updated user {user_id} in database")
-    except Exception as e:
-        logger.error(f"Database error for user {user_id}: {str(e)}")
-    finally:
-        conn.close()
+
