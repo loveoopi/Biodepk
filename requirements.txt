@@ -1,5 +1,4 @@
 pyrogram==2.0.106
 tgcrypto==1.2.5
-python-telegram-bot==20.3
-requests==2.31.0
+uvloop==0.17.0
 ntplib==0.4.0
