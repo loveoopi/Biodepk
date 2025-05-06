@@ -1,4 +1,5 @@
 import os
+import re
 import sqlite3
 import logging
 from datetime import datetime
@@ -22,18 +23,11 @@ logger = logging.getLogger(__name__)
 
 # Database setup
 def init_db():
-    """Initialize SQLite database with proper settings for Heroku"""
+    """Initialize SQLite database"""
     try:
-        conn = sqlite3.connect(
-            'file:bio_links.db?mode=memory&cache=shared',
-            uri=True,
-            timeout=20,
-            check_same_thread=False
-        )
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        
+        conn = sqlite3.connect('user_data/bio_links.db')
         cursor = conn.cursor()
+        
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -43,6 +37,7 @@ def init_db():
                 bio_text TEXT
             )
         ''')
+        
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS deleted_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,14 +46,16 @@ def init_db():
                 timestamp TEXT
             )
         ''')
+        
         conn.commit()
         logger.info("Database initialized successfully")
         return conn
     except sqlite3.Error as e:
-        logger.error(f"Database initialization failed: {e}")
+        logger.error(f"Database error: {e}")
         raise
 
 # Initialize database
+os.makedirs('user_data', exist_ok=True)
 db_conn = init_db()
 
 # Bot setup
@@ -110,8 +107,19 @@ async def start(client: Client, message: Message):
         ]
     )
     await message.reply_text(
-        f"Hi, I am {BOT_NAME}. Add me to groups with Delete Messages permission.",
+        f"Hi, I am {BOT_NAME}. Make me admin with Delete Messages permission.",
         reply_markup=keyboard
+    )
+
+@app.on_callback_query(filters.regex("^help$"))
+async def help_callback(client, callback_query):
+    await callback_query.message.edit_text(
+        "**Bot Commands:**\n"
+        "/enable - Activate link protection\n"
+        "/disable - Deactivate protection\n\n"
+        "**Requirements:**\n"
+        "- Delete Messages permission\n"
+        "- Admin rights to toggle protection"
     )
 
 @app.on_message(filters.command("enable") & filters.group)
@@ -130,50 +138,50 @@ async def disable_protection(client: Client, message: Message):
     else:
         await message.reply("⚠️ You need admin rights to use this command.")
 
-# Message handler
+# Message handler with proper deletion
 @app.on_message(filters.group & ~filters.service)
 async def check_messages(client: Client, message: Message):
     if message.chat.id not in enabled_groups:
         return
 
     try:
+        # Skip if message is from admin
+        if await is_admin(client, message.chat.id, message.from_user.id):
+            return
+
         user = await client.get_users(message.from_user.id)
+        bio_text = getattr(user, 'bio', '')
+        has_link = has_links(bio_text)
+
+        # Update database
         cursor = db_conn.cursor()
-        
-        # Check cache first
-        cursor.execute('SELECT has_link, bio_text FROM users WHERE user_id = ?', (user.id,))
-        result = cursor.fetchone()
-        
-        if result:
-            has_link, bio_text = result
-        else:
-            # Get fresh data
-            bio_text = getattr(user, 'bio', '')
-            has_link = has_links(bio_text)
-            
-            # Store in database
-            cursor.execute('''
-                INSERT INTO users (user_id, username, has_link, bio_text, last_checked)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (user.id, user.username, int(has_link), bio_text, datetime.now().isoformat()))
-            db_conn.commit()
+        cursor.execute('''
+            INSERT OR REPLACE INTO users 
+            (user_id, username, has_link, bio_text, last_checked)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (user.id, user.username, int(has_link), bio_text, datetime.now().isoformat()))
+        db_conn.commit()
 
         if has_link:
             try:
                 await message.delete()
+                logger.info(f"Deleted message from {user.id} in {message.chat.id}")
+                
+                # Log deletion
                 cursor.execute('''
-                    INSERT INTO deleted_messages (user_id, chat_id, timestamp)
+                    INSERT INTO deleted_messages
+                    (user_id, chat_id, timestamp)
                     VALUES (?, ?, ?)
                 ''', (user.id, message.chat.id, datetime.now().isoformat()))
                 db_conn.commit()
-                logger.info(f"Deleted message from {user.id} in {message.chat.id}")
+                
             except BadRequest as e:
-                logger.error(f"Delete failed: {e}")
+                logger.error(f"Delete failed: {e}. Make sure bot has delete permissions.")
+                await message.reply("⚠️ I need Delete Messages permission to work properly!")
 
     except Exception as e:
         logger.error(f"Error processing message: {e}")
 
-# Start the bot
 if __name__ == "__main__":
     logger.info("Starting bot...")
     try:
