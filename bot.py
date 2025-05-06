@@ -5,11 +5,15 @@ import logging
 from datetime import datetime
 from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
-from pyrogram.enums import ChatMemberStatus, ParseMode
+from pyrogram.enums import ChatMemberStatus
+from pyrogram.errors import FloodWait, BadRequest
 from config import API_ID, API_HASH, BOT_TOKEN, DEVELOPER, BOT_NAME
 
-# Setup logging
+# Setup directories
+os.makedirs('user_data', exist_ok=True)
 os.makedirs('logs', exist_ok=True)
+
+# Initialize logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -20,147 +24,115 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Database setup
-os.makedirs('user_data', exist_ok=True)
+# Database initialization
 DB_PATH = 'user_data/bio_links.db'
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    
+    # Users table
     c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (user_id INTEGER PRIMARY KEY, 
-                  has_link INTEGER,
-                  last_checked TEXT)''')
+                 (user_id INTEGER PRIMARY KEY,
+                  username TEXT,
+                  has_link INTEGER DEFAULT 0,
+                  last_checked TEXT,
+                  bio_text TEXT)''')
+    
+    # Deleted messages log
+    c.execute('''CREATE TABLE IF NOT EXISTS deleted_messages
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id INTEGER,
+                  chat_id INTEGER,
+                  timestamp TEXT,
+                  FOREIGN KEY(user_id) REFERENCES users(user_id))''')
+    
     conn.commit()
     conn.close()
 
 init_db()
 
-class UserBioChecker:
+class LinkDetector:
     @staticmethod
-    def has_link_in_bio(bio_text: str) -> bool:
-        """Check if bio contains any links"""
-        patterns = [
-            r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
-            r't\.me/[a-zA-Z0-9_]+',
-            r'@[a-zA-Z0-9_]+',
-            r'[a-zA-Z0-9-]+\.(com|net|org|io|me)'
-        ]
-        if not bio_text:
+    def has_links(text):
+        """Check for multiple types of links in text"""
+        if not text:
             return False
-        return any(re.search(pattern, bio_text, re.IGNORECASE) for pattern in patterns)
+            
+        patterns = [
+            # Standard URLs
+            r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+',
+            # Telegram links
+            r't\.me/\w+',
+            r'@\w+',
+            # Common domains
+            r'\w+\.(com|net|org|io|me|info|xyz)\b',
+            # IP addresses
+            r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}'
+        ]
+        
+        text = text.lower()
+        return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
 
-    @staticmethod
-    def update_user_data(user_id: int, has_link: bool):
-        """Store user bio link status in database"""
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('''INSERT OR REPLACE INTO users 
-                     (user_id, has_link, last_checked) 
-                     VALUES (?, ?, ?)''',
-                  (user_id, int(has_link), datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
+def db_execute(query, params=()):
+    """Helper function for database operations"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(query, params)
+    conn.commit()
+    conn.close()
 
-    @staticmethod
-    def get_user_data(user_id: int) -> tuple:
-        """Retrieve user bio link status from database"""
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('''SELECT has_link FROM users WHERE user_id = ?''', (user_id,))
-        result = c.fetchone()
-        conn.close()
-        return result[0] if result else None
+def db_fetch(query, params=()):
+    """Helper function to fetch data"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(query, params)
+    result = c.fetchall()
+    conn.close()
+    return result
 
-async def is_admin(client: Client, chat_id: int, user_id: int) -> bool:
-    """Check if user is admin or owner"""
+# Rest of your bot implementation...
+# [Keep your existing start, enable, disable commands]
+
+@app.on_message(filters.group & ~filters.service)
+async def check_messages(client, message: Message):
+    if message.chat.id not in enabled_groups:
+        return
+
     try:
-        member = await client.get_chat_member(chat_id, user_id)
-        return member.status in [ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR]
-    except Exception as e:
-        logger.error(f"Admin check error: {e}")
-        return False
+        user = await client.get_users(message.from_user.id)
+        
+        # Check cache first
+        cached_data = db_fetch('SELECT has_link, bio_text FROM users WHERE user_id = ?', (user.id,))
+        
+        if cached_data:
+            has_link, bio_text = cached_data[0]
+        else:
+            # Get fresh data if not cached
+            bio_text = getattr(user, 'bio', '')
+            has_link = LinkDetector.has_links(bio_text)
+            
+            # Store in database
+            db_execute('''INSERT INTO users 
+                         (user_id, username, has_link, last_checked, bio_text)
+                         VALUES (?, ?, ?, ?, ?)''',
+                      (user.id, user.username, int(has_link), datetime.now().isoformat(), bio_text))
 
-async def main():
-    app = Client(
-        "bio_link_protector",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        bot_token=BOT_TOKEN,
-        in_memory=True
-    )
-
-    try:
-        await app.start()
-        bot_username = (await app.get_me()).username
-        logger.info(f"Bot @{bot_username} started successfully!")
-
-        @app.on_message(filters.command("start") & filters.private)
-        async def start(client: Client, message: Message):
-            keyboard = InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton("Developer", url=f"https://t.me/{DEVELOPER.lstrip('@')}"),
-                        InlineKeyboardButton("Help", callback_data="help")
-                    ],
-                    [InlineKeyboardButton("Add me to group", 
-                     url=f"https://t.me/{bot_username}?startgroup=true&admin=delete_messages+restrict_members")]
-                ]
-            )
-            await message.reply_text(
-                f"Hi, I am {BOT_NAME}. Please make me admin with 'Delete Messages' permission.",
-                reply_markup=keyboard
-            )
-
-        @app.on_message(filters.command(["enable", "disable"]) & filters.group)
-        async def toggle_protection(client: Client, message: Message):
-            if not await is_admin(client, message.chat.id, message.from_user.id):
-                await message.reply("⚠️ You need admin rights to use this command.")
-                return
-
-            if "enable" in message.text.lower():
-                enabled_groups.add(message.chat.id)
-                await message.reply("✅ Bio link protection enabled!")
-            else:
-                enabled_groups.discard(message.chat.id)
-                await message.reply("❌ Bio link protection disabled!")
-
-        @app.on_message(filters.group & ~filters.service)
-        async def check_messages(client: Client, message: Message):
-            if message.chat.id not in enabled_groups:
-                return
-
+        if has_link:
             try:
-                # Get full user info including bio
-                user = await client.get_users(message.from_user.id)
+                await message.delete()
+                logger.info(f"Deleted message from {user.id} in {message.chat.id}")
                 
-                # Check if we have cached bio data
-                cached_status = UserBioChecker.get_user_data(user.id)
+                # Log deletion
+                db_execute('''INSERT INTO deleted_messages
+                             (user_id, chat_id, timestamp)
+                             VALUES (?, ?, ?)''',
+                          (user.id, message.chat.id, datetime.now().isoformat()))
                 
-                if cached_status is not None:
-                    has_link = bool(cached_status)
-                else:
-                    # Get fresh bio data if not cached
-                    has_link = False
-                    if hasattr(user, 'bio') and user.bio:
-                        has_link = UserBioChecker.has_link_in_bio(user.bio)
-                        UserBioChecker.update_user_data(user.id, has_link)
-                
-                if has_link:
-                    try:
-                        await message.delete()
-                        logger.info(f"Deleted message from {user.id} in {message.chat.id}")
-                    except BadRequest as e:
-                        logger.error(f"Delete failed: {e}")
-            except Exception as e:
-                logger.error(f"Message processing error: {e}")
-
-        await idle()
+            except BadRequest as e:
+                logger.error(f"Delete failed: {e}")
 
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
-    finally:
-        await app.stop()
+        logger.error(f"Error processing message: {e}")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+# [Rest of your existing bot code]
